@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+openai-whisper
+faster-whisper
+gtts
+edge-tts
+python-multipart
+requests
+pydub

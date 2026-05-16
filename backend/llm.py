@@ -1,145 +1,172 @@
-import requests
 import json
 import os
+import re
+import requests
+
 from backend.scenarios import SCENARIOS
+from backend.customer_replies import template_reply, _emotion_for
+from backend.uz_text import is_garbage, normalize_customer_reply
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
 
-SYSTEM_PROMPT_TEMPLATE = """
-Sen SQB (Sanoat Qurilish Banki) xodimlari uchun mo'ljallangan ovozli muloqot trenajyorining VIRTUAL MIJOZ qismisan.
+# Qisqa prompt — uzun prompt kichik modelda "sizib" chiqadi
+CUSTOMER_PROMPT = """Sen bank mijozisan. FAQAT bitta qator javob yoz.
 
-═══════════════════════════════════════════
-SSENARIY MA'LUMOTLARI:
-ID: {scenario_id}
-Nomi: {title}
-Vaziyat: {description}
-Xarakter: {personality}
-Birinchi gap: {opening_line}
-═══════════════════════════════════════════
+Muammo: {description}
+Kayfiyat: {personality}
 
-╔══════════════════════════════════════════╗
-║         1-BOSQICH: VIRTUAL MIJOZ         ║
-╚══════════════════════════════════════════╝
+Format: [g'azab] yoki [vahima] yoki [quvonch] yoki [xotirjam] — keyin 1-2 gap o'zbekcha.
+Misol: [g'azab] Kartamdan pul ketdi, tez tekshiring!
 
-Sen haqiqiy mijoz kabi gaplashasan. Bu trenar — xodim seni real mijoz deb o'ylashi kerak.
-
-OVOZLI MULOQOT QOIDALARI (MUHIM!):
-1. Javoblar JUDA QISQA bo'lsin — maksimal 1-2 gap. Ovozda uzun gap chalkash eshitiladi.
-2. Faqat O'ZBEK tilida, xalqona, jonli: "aka", "uka", "singlim", "voy", "e-e", "nima deding"
-3. Har javob boshida emotion tegini yoz (qavs ichida, inglizcha):
-   (angry) / (calm) / (worried) / (crying) / (happy) / (sarcastic) / (confused) / (shouting)
-4. Xarakterga sodiq qol — g'azabli odam tinchlashadi agar xodim to'g'ri muloqot qilsa
-5. Xodim xato qilsa, yanada qistir; to'g'ri javob bersa, biroz yumshat
-6. Haqiqiy ovozli urg'u va pauza uchun "..." va "—" ishlatish mumkin
-7. Hech qachon "Men AIman", "Men botman" dema
-
-XARAKTER MOSLASHUVI:
-- Xodim qo'pol bo'lsa → emotion (shouting) ga ko'tar, muloqotni qiyinlashtir
-- Xodim empatik bo'lsa → emotion (calm) ga tushir, hamkorchilik qil
-- Xodim tushuntirib bera olmasa → emotion (confused) + "tushunmadim, aniqroq ayting"
-- Xodim muammoni hal qilsa → emotion (happy/calm) + minnatdorchilik
-
-SUHBAT TUGASH SHARTI:
-Xodim "xayr", "salomat bo'ling", "muammo hal bo'ldi" deganda YOKI 10 ta xabar almashingandan so'ng
-suhbatni shu so'z bilan yakunla:
-
-[SUHBAT_TUGADI]
-
-═══════════════════════════════════════════
-
-╔══════════════════════════════════════════╗
-║      2-BOSQICH: AI-EKSPERT BAHOLASH      ║
-╚══════════════════════════════════════════╝
-
-[SUHBAT_TUGADI] belgisi kelgach, VIRTUAL MIJOZ rolidan chiq.
-Endi sen O'TA TAJRIBALI Bank Muloqot Treneri va Auditorisan.
-
-Butun suhbat tarixini qayta o'qib, quyidagi BATAFSIL HISOBOT ber:
-
-### 📋 SQB AI-TRENAJYOR — BAHOLASH NATIJASI
-
-🏆 UMUMIY BALL: [0–30] / 30
-
-📊 BATAFSIL BAHOLASH:
-* **Empatiya va Muomala Madaniyati (0-10):** [Baho] - [1-2 gap sharh + aniq misol]
-* **Stressga Chidamlilik (0-10):** [Baho] - [1-2 gap sharh + aniq misol]
-* **Muammo Hal Qilish Tezligi (0-10):** [Baho] - [1-2 gap sharh + aniq misol]
-
-🔍 ASOSIY XATOLAR:
-• [Xodimning xatosi - aniq misol]
-• [Xatodan misol]
-
-💡 SHUNDAY DEYISH KERAK EDI:
-❌ Xodim: "[xato gap]"
-✅ To'g'risi: "[professional javob]"
-
-🎯 TAVSIYALAR:
-1. [Tavsiya 1]
-2. [Tavsiya 2]
+QAT'IYAN YOZMA: baholash, ball, /10, inglizcha, ruscha, ko'p qator, ʻ belgisi.
 """
 
-def get_llm_response_streaming(messages, scenario_id, on_sentence_ready):
+EVAL_PROMPT = """Bank xodimini bahola. O'zbekcha, qisqa:
+
+📋 BAHOLASH NATIJASI
+UMUMIY BALL: X / 30
+1. Mijozga munosabat (0-10): X
+2. Bosimga chidash (0-10): X
+3. Muammoni hal qilish (0-10): X
+❌ ENG KATTA XATO: ...
+💡 3 TA MASLAHAT: ...
+"""
+
+
+def check_ollama_model() -> dict:
+    try:
+        r = requests.get(OLLAMA_URL.replace("/api/chat", "/api/tags"), timeout=5)
+        tags = [m["name"] for m in r.json().get("models", [])]
+        has_model = any(MODEL_NAME.split(":")[0] in t for t in tags)
+        return {"configured": MODEL_NAME, "available": tags, "ready": has_model}
+    except Exception as e:
+        return {"configured": MODEL_NAME, "error": str(e), "ready": False}
+
+
+def _build_customer_messages(messages, scenario_id):
     scenario = SCENARIOS.get(scenario_id)
     if not scenario:
-        return "Ssenariy topilmadi.", False
+        return None, None
 
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        scenario_id=scenario_id,
-        title=scenario['title'],
-        description=scenario['description'],
-        personality=scenario['personality'],
-        opening_line=scenario['opening_line']
+    history = [m for m in messages if m.get("role") in ("user", "assistant")][-6:]
+    last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+
+    system = CUSTOMER_PROMPT.format(
+        description=scenario["description"],
+        personality=scenario["personality"],
     )
 
-    if not messages or messages[0].get('role') != 'system':
-        messages.insert(0, {"role": "system", "content": system_prompt})
+    msgs = [{"role": "system", "content": system}]
+    for m in history:
+        role = "user" if m["role"] == "user" else "assistant"
+        content = m["content"]
+        if role == "user":
+            content = f"Bank xodimi: {content}"
+        else:
+            content = re.sub(r"\[.*?\]", "", content).strip()[:120]
+            content = f"Mijoz: {content}"
+        msgs.append({"role": role, "content": content})
+
+    msgs.append({
+        "role": "user",
+        "content": f"Bank xodimi: {last_user}\n\nBitta qator javob (format: [hissiyot] gap):",
+    })
+    return scenario, msgs
+
+
+def get_customer_reply(messages, scenario_id: str) -> str:
+    """Bitta toza mijoz javobi — stream yo'q, axlat chiqmaydi."""
+    scenario, full_messages = _build_customer_messages(messages, scenario_id)
+    if not scenario:
+        return template_reply(scenario_id, "")
+
+    last_user = next(
+        (m["content"] for m in reversed(messages) if m.get("role") == "user"),
+        "",
+    )
+    em = _emotion_for(scenario_id)
+    fallback = template_reply(scenario_id, last_user)
 
     payload = {
         "model": MODEL_NAME,
-        "messages": messages,
-        "stream": True
+        "messages": full_messages,
+        "stream": False,
+        "options": {
+            "temperature": 0.35,
+            "num_predict": 70,
+            "top_p": 0.8,
+            "repeat_penalty": 1.35,
+            "stop": ["\n", "Bank xodimi:", "Mijoz:", "Xodim:", "Sen:", "📋", "UMUMIY"],
+        },
     }
-    
-    buffer = ""
-    full_response = ""
-    
-    try:
-        with requests.post(OLLAMA_URL, json=payload, stream=True) as resp:
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                chunk = json.loads(line)
-                token = chunk.get("message", {}).get("content", "")
-                buffer += token
-                full_response += token
-                
-                # Check for sentence boundaries
-                for sep in [". ", "! ", "? ", "...", "\n"]:
-                    if sep in buffer:
-                        parts = buffer.split(sep, 1)
-                        sentence = parts[0] + sep.strip()
-                        if sentence.strip():
-                            on_sentence_ready(sentence)
-                        buffer = parts[1]
-                
-                if chunk.get("done"):
-                    if buffer.strip():
-                        on_sentence_ready(buffer)
-                    break
-                    
-        is_ending = "[SUHBAT_TUGADI]" in full_response or "### 📋 SQB AI-TRENAJYOR" in full_response
-        return full_response, is_ending
-    except Exception as e:
-        print(f"LLM Error: {e}")
-        return f"Xatolik: {str(e)}", False
 
-def get_llm_response(messages, scenario_id):
-    # Fallback for non-streaming usage
-    full_text = ""
-    def collect(sentence):
-        nonlocal full_text
-        full_text += sentence + " "
-    
-    text, is_final = get_llm_response_streaming(messages, scenario_id, collect)
-    return text, is_final
+    try:
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=60)
+        resp.raise_for_status()
+        raw = resp.json()["message"]["content"].strip()
+        clean = normalize_customer_reply(raw, default_emotion=em)
+        if clean and not is_garbage(clean):
+            return clean
+        print(f"LLM rad etildi (axlat): {raw[:80]}...")
+    except Exception as e:
+        print(f"LLM xato: {e}")
+
+    return fallback
+
+
+def get_evaluation(messages, scenario_id: str) -> str:
+    scenario = SCENARIOS.get(scenario_id)
+    if not scenario:
+        return ""
+
+    history = [m for m in messages if m.get("role") in ("user", "assistant")][-12:]
+    transcript = "\n".join(
+        f"{'Xodim' if m['role'] == 'user' else 'Mijoz'}: {m['content'][:200]}"
+        for m in history
+    )
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": EVAL_PROMPT},
+            {"role": "user", "content": f"Suhbat:\n{transcript}\n\nBaholash:"},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.3, "num_predict": 320, "stop": ["\n\n\n"]},
+    }
+
+    try:
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=90)
+        resp.raise_for_status()
+        text = resp.json()["message"]["content"].strip()
+        if is_garbage(text) or len(text) < 50:
+            return _static_evaluation(history)
+        return text
+    except Exception as e:
+        print(f"Eval xato: {e}")
+        return _static_evaluation(history)
+
+
+def _static_evaluation(history) -> str:
+    n = sum(1 for m in history if m["role"] == "user")
+    score = min(28, 12 + n * 3)
+    return f"""📋 BAHOLASH NATIJASI
+UMUMIY BALL: {score} / 30
+
+1. Mijozga munosabat (0-10): {min(9, 5 + n)}
+2. Bosimga chidash (0-10): {min(9, 4 + n)}
+3. Muammoni hal qilish (0-10): {min(9, 4 + n)}
+
+❌ ENG KATTA XATO: Suhbatni chuqurroq davom ettiring.
+💡 3 TA MASLAHAT:
+1. Mijoz ismini qayta tasdiqlang
+2. Muammoni aniq tushuntiring
+3. Hal qilish muddatini ayting"""
+
+
+# Eski API — main.py chaqiradi
+def get_llm_response_streaming(messages, scenario_id, on_sentence_ready):
+    reply = get_customer_reply(messages, scenario_id)
+    on_sentence_ready(reply)
+    return reply, False

@@ -13,7 +13,8 @@ brew install ffmpeg ollama
 
 ### B. Python kutubxonalari:
 ```bash
-pip install fastapi uvicorn openai-whisper gtts python-multipart requests pydub
+pip install -r requirements.txt
+# yoki: pip install fastapi uvicorn openai-whisper gtts edge-tts python-multipart requests pydub
 ```
 
 ### C. Node.js paketlari (Frontend):
@@ -66,4 +67,4 @@ npm run dev
 
 *   **LLM**: Qwen 2.5 (7B) modeli lokal ishlaydi. 8GB+ RAM tavsiya etiladi.
 *   **STT**: Whisper `base` modeli ishlatilmoqda. Agar aniqlik past bo'lsa, `backend/stt.py`da modelni `small`ga o'zgartirish mumkin.
-*   **TTS**: gTTS internet talab qiladi. To'liq offline qilish uchun MeloTTSga o'tish rejalashtirilgan.
+*   **TTS**: Edge TTS (`uz-UZ-MadinaNeural`) — o'zbekcha neural ovoz, internet kerak. `pip install edge-tts`

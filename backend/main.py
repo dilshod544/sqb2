@@ -1,21 +1,21 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import Response, JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from backend.stt import transcribe_audio
-from backend.llm import get_llm_response_streaming, get_llm_response
+from backend.llm import get_customer_reply, get_evaluation, check_ollama_model, MODEL_NAME
 from backend.tts import text_to_speech
 from backend.scenarios import SCENARIOS
-from backend.emotion import extract_emotion, apply_emotion_to_audio
+from backend.emotion import extract_emotion, apply_emotion_to_audio, opening_emotion_tag
+from backend.uz_text import is_garbage
 import json
 import base64
 import asyncio
 import threading
 import queue
-import time
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
 
-# Enable CORS for Next.js frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,96 +24,139 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_tts_pool = ThreadPoolExecutor(max_workers=2)
+
+
 @app.get("/scenarios")
 async def get_scenarios():
     return SCENARIOS
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "ollama": check_ollama_model()}
+
+
+def _tts_with_emotion(sentence: str):
+    emotion, clean = extract_emotion(sentence)
+    clean = clean.replace("[SUHBAT_TUGADI]", "").strip()
+    if not clean or is_garbage(clean):
+        return None, emotion, sentence
+    audio = text_to_speech(clean)
+    if not audio:
+        return None, emotion, sentence
+    return base64.b64encode(apply_emotion_to_audio(audio, emotion)).decode(), emotion, sentence
+
 
 @app.post("/process-stream")
 async def process_voice_stream(
     audio: UploadFile = File(...),
     scenario_id: str = Form(...),
-    history: str = Form(...)
+    history: str = Form(...),
 ):
     audio_bytes = await audio.read()
-    
-    # 1. STT (Sync but we can run it here)
     user_text = transcribe_audio(audio_bytes)
-    
+
     async def generate():
-        # First, send the transcribed text
+        if not user_text.strip():
+            yield json.dumps({
+                "type": "error",
+                "text": "Tushunmadim. O'zbekcha, aniq gapiring.",
+            }) + "\n"
+            yield json.dumps({"type": "done", "is_final": False}) + "\n"
+            return
+
         yield json.dumps({"type": "stt", "text": user_text}) + "\n"
-        
+
         chat_history = json.loads(history)
         chat_history.append({"role": "user", "content": user_text})
-        
-        full_llm_text = ""
+
         sentence_queue = queue.Queue()
-        is_done_flag = [False] # Use a list to make it mutable in closure
+        is_done_flag = [False]
+        evaluation_text = ""
 
-        def on_sentence(sentence):
-            nonlocal full_llm_text
-            full_llm_text += sentence + " "
-            
-            emotion, clean = extract_emotion(sentence)
-            clean = clean.replace("[SUHBAT_TUGADI]", "").strip()
-            
-            if not clean:
-                return
+        def _user_wants_end(text: str) -> bool:
+            t = text.lower()
+            return any(w in t for w in ("xayr", "hayr", "salomat", "sog bo"))
 
-            audio_data = text_to_speech(clean)
-            audio_b64 = None
-            if audio_data:
-                # Apply emotion parameters via ffmpeg
-                audio_with_emotion = apply_emotion_to_audio(audio_data, emotion)
-                audio_b64 = base64.b64encode(audio_with_emotion).decode()
-            
-            sentence_queue.put({
-                "type": "llm_chunk",
-                "text": sentence,
-                "emotion": emotion,
-                "audio_base64": audio_b64
-            })
+        def run_pipeline():
+            nonlocal evaluation_text
+            try:
+                reply = get_customer_reply(chat_history, scenario_id)
+                audio_b64, emotion, sent = _tts_with_emotion(reply)
+                sentence_queue.put({
+                    "type": "llm_chunk",
+                    "text": sent,
+                    "emotion": emotion,
+                    "audio_base64": audio_b64,
+                    "is_evaluation": False,
+                })
 
-        # Run LLM in a separate thread
-        def run_llm():
-            get_llm_response_streaming(chat_history, scenario_id, on_sentence)
-            is_done_flag[0] = True
+                user_turns = sum(1 for m in chat_history if m.get("role") == "user")
+                if _user_wants_end(user_text) or user_turns >= 6:
+                    evaluation_text = get_evaluation(chat_history, scenario_id)
+                    sentence_queue.put({
+                        "type": "llm_chunk",
+                        "text": evaluation_text,
+                        "emotion": None,
+                        "audio_base64": None,
+                        "is_evaluation": True,
+                    })
+            except Exception as e:
+                print(f"Pipeline xato: {e}")
+                sentence_queue.put({
+                    "type": "error",
+                    "text": "Xatolik. Qayta urinib ko'ring.",
+                })
+            finally:
+                is_done_flag[0] = True
 
-        thread = threading.Thread(target=run_llm)
-        thread.start()
+        threading.Thread(target=run_pipeline, daemon=True).start()
 
-        # Stream results from queue
         while not is_done_flag[0] or not sentence_queue.empty():
             try:
-                # Use a small timeout to not block too long
                 item = sentence_queue.get(timeout=0.1)
                 yield json.dumps(item) + "\n"
             except queue.Empty:
-                await asyncio.sleep(0.05)
-                continue
-        
-        # Determine if it's the final evaluation
-        is_final = "[SUHBAT_TUGADI]" in full_llm_text or "### 📋 SQB AI-TRENAJYOR" in full_llm_text
-        yield json.dumps({"type": "done", "is_final": is_final}) + "\n"
+                await asyncio.sleep(0.02)
+
+        is_final = bool(evaluation_text) or _user_wants_end(user_text)
+        yield json.dumps({
+            "type": "done",
+            "is_final": is_final,
+            "evaluation": evaluation_text,
+        }) + "\n"
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
+
 
 @app.post("/start")
 async def start_scenario(scenario_id: str = Form(...)):
     scenario = SCENARIOS.get(scenario_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="Ssenariy topilmadi")
-    
-    llm_text = scenario['opening_line']
-    audio_response = text_to_speech(llm_text)
-    
-    audio_base64 = base64.b64encode(audio_response).decode('utf-8') if audio_response else None
-    
-    return {
-        "llm_text": llm_text,
-        "audio_base64": audio_base64
-    }
+
+    tag = opening_emotion_tag(scenario["personality"])
+    opening = scenario["opening_line"]
+    llm_text = opening if opening.strip().startswith("[") else f"{tag} {opening}"
+
+    emotion, clean = extract_emotion(llm_text)
+    audio_response = text_to_speech(clean)
+    if audio_response:
+        audio_response = apply_emotion_to_audio(audio_response, emotion)
+
+    audio_base64 = base64.b64encode(audio_response).decode("utf-8") if audio_response else None
+
+    return {"llm_text": llm_text, "audio_base64": audio_base64}
+
 
 if __name__ == "__main__":
     import uvicorn
+
+    info = check_ollama_model()
+    if not info.get("ready"):
+        print(f"⚠️  Ollama model topilmadi: {MODEL_NAME}")
+        print(f"   Ishga tushiring: ollama pull {MODEL_NAME}")
+    else:
+        print(f"✓ Model tayyor: {MODEL_NAME}")
     uvicorn.run(app, host="0.0.0.0", port=8000)
