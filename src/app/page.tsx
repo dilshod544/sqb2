@@ -16,7 +16,8 @@ export default function AITrenajyor() {
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const messagesEndRef = useRef(null);
-  const audioRef = useRef(null);
+  const audioQueue = useRef([]);
+  const isPlayingAudio = useRef(false);
 
   useEffect(() => {
     fetch('http://localhost:8000/scenarios')
@@ -46,7 +47,7 @@ export default function AITrenajyor() {
       setStep('training');
       
       if (data.audio_base64) {
-        playAudio(data.audio_base64);
+        queueAudio(data.audio_base64);
       }
     } catch (err) {
       console.error(err);
@@ -55,8 +56,23 @@ export default function AITrenajyor() {
     }
   };
 
-  const playAudio = (base64) => {
+  const queueAudio = (base64) => {
+    audioQueue.current.push(base64);
+    processAudioQueue();
+  };
+
+  const processAudioQueue = () => {
+    if (isPlayingAudio.current || audioQueue.current.length === 0) return;
+
+    isPlayingAudio.current = true;
+    const base64 = audioQueue.current.shift();
     const audio = new Audio(`data:audio/mp3;base64,${base64}`);
+    
+    audio.onended = () => {
+      isPlayingAudio.current = false;
+      processAudioQueue();
+    };
+    
     audio.play();
   };
 
@@ -71,7 +87,7 @@ export default function AITrenajyor() {
 
     mediaRecorderRef.current.onstop = async () => {
       const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-      processAudio(audioBlob);
+      processAudioStream(audioBlob);
     };
 
     mediaRecorderRef.current.start();
@@ -83,7 +99,7 @@ export default function AITrenajyor() {
     setIsRecording(false);
   };
 
-  const processAudio = async (blob) => {
+  const processAudioStream = async (blob) => {
     setIsProcessing(true);
     
     try {
@@ -92,30 +108,54 @@ export default function AITrenajyor() {
       formData.append('scenario_id', selectedScenario);
       formData.append('history', JSON.stringify(messages));
       
-      const res = await fetch('http://localhost:8000/process', {
+      const response = await fetch('http://localhost:8000/process-stream', {
         method: 'POST',
         body: formData,
       });
-      
-      const data = await res.json();
-      
-      if (data.user_text) {
-        setMessages(prev => [...prev, { role: 'user', content: data.user_text }]);
-      }
-      
-      if (data.llm_text) {
-        setMessages(prev => [...prev, { role: 'assistant', content: data.llm_text }]);
-        if (data.audio_base64) {
-          playAudio(data.audio_base64);
-        }
-        
-        if (data.is_final) {
-          setEvaluation(data.llm_text);
-          setStep('evaluation');
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      // Initialize assistant message if not already there
+      let currentAssistantMessage = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // Keep the last partial line
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const data = JSON.parse(line);
+
+          if (data.type === 'stt') {
+            setMessages(prev => [...prev, { role: 'user', content: data.text }]);
+            // Add a placeholder for assistant response
+            setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
+          } else if (data.type === 'llm_chunk') {
+            currentAssistantMessage += data.text;
+            setMessages(prev => {
+              const newMessages = [...prev];
+              newMessages[newMessages.length - 1].content = currentAssistantMessage;
+              return newMessages;
+            });
+            
+            if (data.audio_base64) {
+              queueAudio(data.audio_base64);
+            }
+          } else if (data.type === 'done') {
+            if (data.is_final) {
+              setStep('evaluation');
+            }
+          }
         }
       }
     } catch (err) {
-      console.error(err);
+      console.error('Streaming error:', err);
     } finally {
       setIsProcessing(false);
     }
@@ -126,6 +166,8 @@ export default function AITrenajyor() {
     setSelectedScenario(null);
     setMessages([]);
     setEvaluation(null);
+    audioQueue.current = [];
+    isPlayingAudio.current = false;
   };
 
   if (step === 'selection') {
@@ -207,11 +249,13 @@ export default function AITrenajyor() {
                   ? 'bg-blue-600 text-white rounded-tr-none' 
                   : 'bg-gray-800 text-gray-200 rounded-tl-none border border-gray-700'
               } shadow-sm`}>
-                {m.content.split('\n').map((line, idx) => (
-                  <p key={idx} className={line.startsWith('#') ? 'font-bold text-lg mb-2' : 'mb-1'}>
+                {m.content.split('\n').map((line, idx) => {
+                  if (line.startsWith('###')) return <h3 key={idx} className="font-bold text-xl my-4 text-blue-400">{line.replace(/###/g, '').trim()}</h3>;
+                  if (line.startsWith('* **')) return <p key={idx} className="ml-4 mb-2"><strong>{line.split('**')[1]}</strong>{line.split('**')[2]}</p>;
+                  return <p key={idx} className={line.startsWith('#') ? 'font-bold text-lg mb-2' : 'mb-1'}>
                     {line}
-                  </p>
-                ))}
+                  </p>;
+                })}
               </div>
             </div>
           </div>
